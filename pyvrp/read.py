@@ -3,18 +3,19 @@ import pathlib
 from numbers import Number
 from typing import Callable, Union
 from warnings import warn
+from collections import defaultdict
 
 import numpy as np
 import vrplib
 
-from pyvrp._pyvrp import Client, Depot, ProblemData, VehicleType
-from pyvrp.constants import MAX_VALUE
+from pyvrp._pyvrp import Client, ProblemData, VehicleType
+from pyvrp.constants import MAX_USER_VALUE
 from pyvrp.exceptions import ScalingWarning
 
 _Routes = list[list[int]]
 _RoundingFunc = Callable[[np.ndarray], np.ndarray]
 
-_INT_MAX = np.iinfo(np.int64).max
+_INT_MAX = np.iinfo(np.int32).max
 
 
 def round_nearest(vals: np.ndarray):
@@ -33,6 +34,7 @@ def no_rounding(vals):
     return vals
 
 
+INSTANCE_FORMATS = ["vrplib", "solomon"]
 ROUND_FUNCS: dict[str, _RoundingFunc] = {
     "round": round_nearest,
     "trunc": convert_to_int,
@@ -44,6 +46,7 @@ ROUND_FUNCS: dict[str, _RoundingFunc] = {
 
 def read(
     where: Union[str, pathlib.Path],
+    instance_format: str = "vrplib",
     round_func: Union[str, _RoundingFunc] = "none",
 ) -> ProblemData:
     """
@@ -61,6 +64,9 @@ def read(
     where
         File location to read. Assumes the data on the given location is in
         VRPLIB format.
+    instance_format
+        File format of the instance to read, one of ``'vrplib'`` (default) or
+        ``'solomon'``.
     round_func
         Optional rounding function. Will be applied to round data if the data
         is not already integer. This can either be a function or a string:
@@ -93,19 +99,26 @@ def read(
             f" or one of {ROUND_FUNCS.keys()}."
         )
 
-    instance = vrplib.read_instance(where)
+    instance = vrplib.read_instance(where, instance_format=instance_format)
 
-    # VRPLIB instances typically do not have a duration data field, so we
-    # assume duration == distance.
-    durations = distances = round_func(instance["edge_weight"])
+    # A priori checks
+    if "dimension" in instance:
+        dimension: int = instance["dimension"]
+    else:
+        if "demand" not in instance:
+            raise ValueError("File should either contain dimension or demands")
+        dimension = len(instance["demand"])
 
-    dimension: int = instance.get("dimension", durations.shape[0])
-    depot_idcs: np.ndarray = instance.get("depot", np.array([0]))
+    depots: np.ndarray = instance.get("depot", np.array([0]))
     num_vehicles: int = instance.get("vehicles", dimension - 1)
 
-    capacity: int = instance.get("capacity", _INT_MAX)
-    if capacity != _INT_MAX:
-        capacity = round_func(np.array([capacity])).item()
+    if "capacity" in instance:
+        if isinstance(instance["capacity"], Number):
+            capacities = np.full(num_vehicles, instance["capacity"])
+        else:
+            capacities = instance["capacity"]
+    else:
+        capacities: np.ndarray = instance.get("capacity", _INT_MAX)
 
     # If this value is supplied, we should pass it through the round func and
     # then unwrap the result. If it's not given, the default value is None,
@@ -114,14 +127,12 @@ def read(
     if max_duration != _INT_MAX:
         max_duration = round_func(np.array([max_duration])).item()
 
-    if "backhaul" in instance:
-        backhauls: np.ndarray = round_func(instance["backhaul"])
-    else:
-        backhauls = np.zeros(dimension, dtype=int)
+    # VRPLIB instances typically do not have a duration data field, so we
+    # assume duration == distance if the instance has time windows.
+    durations = distances = round_func(instance["edge_weight"])
 
-    if "demand" in instance or "linehaul" in instance:
-        demands: np.ndarray = instance.get("demand", instance.get("linehaul"))
-        demands = round_func(demands)
+    if "demand" in instance:
+        demands: np.ndarray = instance["demand"]
     else:
         demands = np.zeros(dimension, dtype=int)
 
@@ -151,13 +162,16 @@ def read(
         time_windows[:, 1] = _INT_MAX
 
     if "vehicles_depot" in instance:
-        items: list[list[int]] = [[] for _ in depot_idcs]
-        for vehicle, depot in enumerate(instance["vehicles_depot"], 1):
-            items[depot - 1].append(vehicle)
-
-        depot_vehicle_pairs = items
+        vehicles_depots: np.ndarray = instance["vehicles_depot"]
     else:
-        depot_vehicle_pairs = [[idx + 1 for idx in range(num_vehicles)]]
+        vehicles_depots = np.full(num_vehicles, depots[0])
+
+    if "vehicles_fixed_cost" in instance:
+        vehicles_fixed_costs: np.ndarray = round_func(
+            instance["vehicles_fixed_cost"]
+        )
+    else:
+        vehicles_fixed_costs = np.zeros(num_vehicles, dtype=int)
 
     if "release_time" in instance:
         release_times: np.ndarray = round_func(instance["release_time"])
@@ -166,72 +180,63 @@ def read(
 
     prizes = round_func(instance.get("prize", np.zeros(dimension, dtype=int)))
 
-    if instance.get("type") == "VRPB":
-        # In VRPB, linehauls must be served before backhauls. This can be
-        # enforced by setting a high value for the distance/duration from depot
-        # to backhaul (forcing linehaul to be served first) and a large value
-        # from backhaul to linehaul (avoiding linehaul after backhaul clients).
-        linehaul = np.flatnonzero(demands > 0)
-        backhaul = np.flatnonzero(backhauls > 0)
-        distances[0, backhaul] = MAX_VALUE
-        distances[np.ix_(backhaul, linehaul)] = MAX_VALUE
-
     # Checks
-    contiguous_lower_idcs = np.arange(len(depot_idcs))
-    if len(depot_idcs) == 0 or (depot_idcs != contiguous_lower_idcs).any():
+    if len(depots) == 0 or (depots != np.arange(len(depots))).any():
         msg = """
         Source file should contain at least one depot in the contiguous lower
         indices, starting from 1.
         """
         raise ValueError(msg)
 
-    if max(distances.max(), durations.max()) > MAX_VALUE:
+    if max(distances.max(), durations.max()) > MAX_USER_VALUE:
         msg = """
         The maximum distance or duration value is very large. This might
         impact numerical stability. Consider rescaling your input data.
         """
         warn(msg, ScalingWarning)
 
-    depots = [
-        Depot(
-            x=coords[idx][0],
-            y=coords[idx][1],
-            tw_early=time_windows[idx][0],
-            tw_late=time_windows[idx][1],
-        )
-        for idx in range(len(depot_idcs))
-    ]
-
     clients = [
         Client(
-            x=coords[idx][0],
-            y=coords[idx][1],
-            delivery=demands[idx],
-            pickup=backhauls[idx],
-            service_duration=service_times[idx],
-            tw_early=time_windows[idx][0],
-            tw_late=time_windows[idx][1],
-            release_time=release_times[idx],
-            prize=prizes[idx],
-            required=np.isclose(prizes[idx], 0),  # only when prize is zero
+            coords[idx][0],  # x
+            coords[idx][1],  # y
+            demands[idx],
+            service_times[idx],
+            time_windows[idx][0],  # TW early
+            time_windows[idx][1],  # TW late
+            release_times[idx],
+            prizes[idx],
+            np.isclose(prizes[idx], 0),  # required only when prize is zero
         )
-        for idx in range(len(depot_idcs), dimension)
+        for idx in range(dimension)
     ]
+
+    vehicles = list(zip(capacities, vehicles_fixed_costs, vehicles_depots))
+    type2idcs = defaultdict(list)
+
+    for idx, tp in enumerate(vehicles):
+        type2idcs[tp].append(idx)
 
     vehicle_types = [
         VehicleType(
-            num_available=len(vehicles),
-            capacity=capacity,
-            depot=depot_idx,
+            len(vehicles),
+            capacity,
+            depot_idx,
+            fixed_cost=fixed_cost,
             max_duration=max_duration,
             # A bit hacky, but this csv-like name is really useful to track the
             # actual vehicles that make up this vehicle type.
             name=",".join(map(str, vehicles)),
         )
-        for depot_idx, vehicles in enumerate(depot_vehicle_pairs)
+        for (capacity, fixed_cost, depot_idx), vehicles in type2idcs.items()
     ]
 
-    return ProblemData(clients, depots, vehicle_types, distances, durations)
+    return ProblemData(
+        clients[len(depots) :],
+        clients[: len(depots)],
+        vehicle_types,
+        distances,
+        durations,
+    )
 
 
 def read_solution(where: Union[str, pathlib.Path]) -> _Routes:
