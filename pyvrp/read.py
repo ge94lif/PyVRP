@@ -3,6 +3,7 @@ import pathlib
 from numbers import Number
 from typing import Callable, Union
 from warnings import warn
+from collections import defaultdict
 
 import numpy as np
 import vrplib
@@ -110,7 +111,14 @@ def read(
 
     depots: np.ndarray = instance.get("depot", np.array([0]))
     num_vehicles: int = instance.get("vehicles", dimension - 1)
-    capacity: int = instance.get("capacity", _INT_MAX)
+
+    if "capacity" in instance:
+        if isinstance(instance["capacity"], Number):
+            capacities = np.full(num_vehicles, instance["capacity"])
+        else:
+            capacities = instance["capacity"]
+    else:
+        capacities: np.ndarray = instance.get("capacity", _INT_MAX)
 
     # If this value is supplied, we should pass it through the round func and
     # then unwrap the result. If it's not given, the default value is None,
@@ -154,13 +162,16 @@ def read(
         time_windows[:, 1] = _INT_MAX
 
     if "vehicles_depot" in instance:
-        items: list[list[int]] = [[] for _ in depots]
-        for vehicle, depot in enumerate(instance["vehicles_depot"], 1):
-            items[depot - 1].append(vehicle)
-
-        depot_vehicle_pairs = items
+        vehicles_depots: np.ndarray = instance["vehicles_depot"]
     else:
-        depot_vehicle_pairs = [[idx + 1 for idx in range(num_vehicles)]]
+        vehicles_depots = np.full(num_vehicles, depots[0])
+
+    if "vehicles_fixed_cost" in instance:
+        vehicles_fixed_costs: np.ndarray = round_func(
+            instance["vehicles_fixed_cost"]
+        )
+    else:
+        vehicles_fixed_costs = np.zeros(num_vehicles, dtype=int)
 
     if "release_time" in instance:
         release_times: np.ndarray = round_func(instance["release_time"])
@@ -199,17 +210,24 @@ def read(
         for idx in range(dimension)
     ]
 
+    vehicles = list(zip(capacities, vehicles_fixed_costs, vehicles_depots))
+    type2idcs = defaultdict(list)
+
+    for idx, tp in enumerate(vehicles):
+        type2idcs[tp].append(idx)
+
     vehicle_types = [
         VehicleType(
             len(vehicles),
             capacity,
             depot_idx,
+            fixed_cost=fixed_cost,
             max_duration=max_duration,
             # A bit hacky, but this csv-like name is really useful to track the
             # actual vehicles that make up this vehicle type.
             name=",".join(map(str, vehicles)),
         )
-        for depot_idx, vehicles in enumerate(depot_vehicle_pairs)
+        for (capacity, fixed_cost, depot_idx), vehicles in type2idcs.items()
     ]
 
     return ProblemData(
